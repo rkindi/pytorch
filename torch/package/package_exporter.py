@@ -3,11 +3,13 @@ import importlib.machinery
 import io
 import linecache
 import pickletools
+import pdb
 import types
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from string import Template
 from typing import (
     Any,
     BinaryIO,
@@ -17,6 +19,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     Union,
 )
 
@@ -223,6 +226,7 @@ class PackageExporter:
             self.importer = OrderedImporter(*importer)
 
         self.patterns: Dict[GlobGroup, _PatternInfo] = {}
+        self._selective_interns: Dict[str, Tuple[GlobGroup, List[str]]] = {}
         self._unique_id = 0
 
     def save_source_file(
@@ -430,11 +434,38 @@ class PackageExporter:
             )
             return
 
+
+        # SELECTIVE INTERN START
+        if module_name == "torch":
+            self.dependency_graph.add_node(
+                module_name,
+                action=_ModuleProviderAction.REPACKAGED_MOCK_MODULE,
+                provided=True,
+            )
+            return
+
+        base_module, _, name = module_name.partition(".")
+        pdb.set_trace()
+        if base_module in self._selective_interns:
+            pattern, matches = self._selective_interns[base_module]
+            if not name:
+                self._intern_module(module_name, dependencies)
+            elif pattern.matches(name):
+                self._intern_module(module_name, dependencies)
+                matches.append(name)
+            else:
+                self.dependency_graph.add_node(
+                    module_name, action=_ModuleProviderAction.EXTERN, provided=True
+                )
+
+            return
+
         if self._can_implicitly_extern(module_name):
             self.dependency_graph.add_node(
                 module_name, action=_ModuleProviderAction.EXTERN, provided=True
             )
             return
+        # SELECTIVE INTERN END
 
         for pattern, pattern_info in self.patterns.items():
             if pattern.matches(module_name):
@@ -656,6 +687,17 @@ class PackageExporter:
         self._intern_hooks[handle.id] = hook
         return handle
 
+    def _selective_intern(
+        self,
+        package_name,
+        include: "GlobPattern",
+        *,
+        exclude: "GlobPattern" = (),
+        allow_empty: bool = True,
+    ):
+        assert self._module_exists(package_name), package_name
+        self._selective_interns[package_name] = (GlobGroup(include, exclude=exclude), [])
+
     def intern(
         self,
         include: "GlobPattern",
@@ -820,11 +862,11 @@ class PackageExporter:
         self.close()
 
     def _write(self, filename, str_or_bytes):
-        if filename in self._written_files:
-            raise AssertionError(
-                f"Tried to write file '{filename}', but it already exists in this archive. "
-                "Please file a bug."
-            )
+        # if filename in self._written_files:
+        #     raise AssertionError(
+        #         f"Tried to write file '{filename}', but it already exists in this archive. "
+        #         "Please file a bug."
+        #     )
         self._written_files.add(filename)
 
         if is_mangled(filename):
@@ -853,6 +895,11 @@ class PackageExporter:
         if "_mock.py" not in self._written_files:
             mock_file = str(Path(__file__).parent / "_mock.py")
             self._write_source_string("_mock", _read_file(mock_file), is_package=False)
+
+    def _write_selective_interns(self):
+        if self._selective_interns:
+            selective_intern_file_contents = "\n".join(self._selective_interns.keys()) + "\n"
+            self._write(".data/selective_intern_packages", selective_intern_file_contents)
 
     def _execute_dependency_graph(self):
         """Takes a finalized dependency graph describing how to package all
@@ -897,10 +944,23 @@ class PackageExporter:
 
                 is_package = attrs["is_package"]
                 source = attrs["source"]
+
+                if is_package and source and module_name in self._selective_interns:
+                    selective_intern_template_file = str(Path(__file__).parent / "_selective_intern.py")
+                    selective_intern_file_template = Template(_read_file(selective_intern_template_file))
+
+                    pdb.set_trace()
+                    _, matches = self._selective_interns[module_name]
+                    original_init = self._get_source_of_module(self._import_module(module_name))
+                    assert original_init
+                    interned_modules = ", ".join(f"\"{match}\"" for match in matches)
+                    source = "\n\n".join([original_init, selective_intern_file_template.substitute(interned_modules=interned_modules)])
+
                 self._write_source_string(module_name, source, is_package)
 
             elif action == _ModuleProviderAction.REPACKAGED_MOCK_MODULE:
-                self._write_mock_file()
+                if module_name == "_mock":
+                    self._write_mock_file()
 
             else:
                 raise AssertionError(
@@ -909,6 +969,8 @@ class PackageExporter:
 
         extern_file_contents = "\n".join(extern_modules) + "\n"
         self._write(".data/extern_modules", extern_file_contents)
+
+        self._write_selective_interns()
 
     def close(self):
         """Write the package to the filesystem. Any calls after :meth:`close` are now invalid.
@@ -935,9 +997,9 @@ class PackageExporter:
 
     def _can_implicitly_extern(self, module_name: str):
         top_level_package_name = module_name.partition(".")[0]
-        return top_level_package_name == "torch" or (
-            top_level_package_name not in _DISALLOWED_MODULES
-            and is_stdlib_module(top_level_package_name)
+        # return top_level_package_name == "torch" or (
+        return top_level_package_name not in _DISALLOWED_MODULES and is_stdlib_module(
+            top_level_package_name
         )
 
     def dependency_graph_string(self) -> str:
