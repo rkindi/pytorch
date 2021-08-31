@@ -421,14 +421,15 @@ void BytecodeDeserializer::parseMethods(
           debug_info_function_name == function_name,
           "The function names in the bytecode table and the debug info table do not match.");
       IValue& debug_handles_table = debug_handles_m_tuple[1];
-      debug_handles_list =
-          (expect_field(
-               std::move(debug_handles_table).toTuple()->elements(),
-               "function_debug_handles",
-               BYTECODE_INDEX_MODULE_DEBUG_HANDLES)
-               .toTuple()
-               ->elements())[0]
-              .toIntList();
+      auto debugHandlesElements =
+          std::move(*std::move(debug_handles_table).toTuple()).elements();
+      debug_handles_list = (expect_field(
+                                debugHandlesElements,
+                                "function_debug_handles",
+                                BYTECODE_INDEX_MODULE_DEBUG_HANDLES)
+                                .toTuple()
+                                ->elements())[0]
+                               .toIntList();
       TORCH_CHECK(
           debug_handles_list.size() == ins_list.size(),
           "The numbers of instructions and debug handles strings do not match.");
@@ -583,7 +584,8 @@ mobile::Module BytecodeDeserializer::deserialize(
   bool has_debug_handles{false};
   if (reader_->hasRecord("mobile_debug_handles.pkl")) {
     debug_handles =
-        readArchive("mobile_debug_handles", mcu).toTuple()->elements();
+        std::move(*readArchive("mobile_debug_handles", mcu).toTuple())
+            .elements();
     has_debug_handles = true;
   }
   parseMethods(std::move(bvals), std::move(debug_handles), *mcu);
