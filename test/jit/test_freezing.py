@@ -1585,6 +1585,83 @@ class TestFrozenOptimizations(JitTestCase):
             test_conv_fusion(use_bias, nn.Conv2d, False, pytorch_op, False,
                              add_tensor=torch.rand(1).to(torch.int), expect_success=False)
 
+    # @unittest.skipIf(not torch._C.has_cuda, "Optimization currently only run for GPU")
+    def test_linear_concat(self):
+        out_dimms = [[5, 10]]  # , [5, 10], [1, 5]]
+
+        for w1_dim, w2_dim in out_dimms:
+            class ModMultLinear(nn.Module):
+                def __init__(self, w1_dim, w2_dim):
+                    super(ModMultLinear, self).__init__()
+                    self.w1 = torch.rand([w1_dim, 5])
+                    self.b1 = torch.rand([w1_dim])
+                    self.w2 = torch.rand([w2_dim, 5])
+                    self.b2 = torch.rand([w2_dim])
+
+                def forward(self, in_tensor1):
+                    res1 = torch._C._nn.linear(in_tensor1, self.w1, self.b1)
+                    res2 = torch._C._nn.linear(in_tensor1, self.w2, self.b2)
+                    return res1, res2
+            
+            mod_eager = ModMultLinear(w1_dim, w2_dim).eval()
+            script_mod = torch.jit.script(mod_eager)
+            op_graph = script_mod.graph
+            print(op_graph)
+
+            FileCheck().check_count("aten::linear", 2, exactly=True).run(op_graph)
+            # successively no-ops with non-const inputs
+            self.run_pass("concat_frozen_linear", op_graph)
+            FileCheck().check_count("aten::linear", 2, exactly=True).run(op_graph)
+
+            script_mod = torch.jit.freeze(script_mod)
+            op_graph = script_mod.graph
+            self.run_pass("concat_frozen_linear", op_graph)
+            FileCheck().check_count("aten::linear", 1, exactly=True).run(op_graph)
+
+            test_val1 = torch.rand([50, 5])
+            self.assertEqual(mod_eager.forward(test_val1), script_mod(test_val1))
+
+    def test_linear_concat_different_input(self):
+        """
+        There should be no change to the graph due to the optimization pass
+        due to the two input tensors being different
+        """
+
+        # Freezing requires that the graph be a module
+        class ModMultLinear(nn.Module):
+            def __init__(self, w1_dim, w2_dim):
+                super(ModMultLinear, self).__init__()
+                self.w1 = torch.rand([w1_dim, 5])
+                self.b1 = torch.rand([w1_dim])
+                self.w2 = torch.rand([w2_dim, 5])
+                self.b2 = torch.rand([w2_dim])
+
+            def forward(self, in_tensor1, in_tensor2):
+                res1 = torch._C._nn.linear(in_tensor1, self.w1, self.b1)
+                res2 = torch._C._nn.linear(in_tensor2, self.w2, self.b2)
+                return res1, res2
+        
+        mod_eager = ModMultLinear(5, 5).eval()
+        script_mod = torch.jit.script(mod_eager)
+        op_graph = script_mod.graph
+        print(op_graph)
+
+        FileCheck().check_count("aten::linear", 2, exactly=True).run(op_graph)
+        # successively no-ops with non-const inputs
+        self.run_pass("concat_frozen_linear", op_graph)
+        FileCheck().check_count("aten::linear", 2, exactly=True).run(op_graph)
+
+        script_mod = torch.jit.freeze(script_mod)
+        op_graph = script_mod.graph
+        self.run_pass("concat_frozen_linear", op_graph)
+        FileCheck().check_count("aten::linear", 2, exactly=True).run(op_graph)
+
+        test_val1 = torch.rand([50, 5])
+        test_val2 = torch.rand([50, 5])
+        self.assertEqual(mod_eager(test_val1, test_val2), script_mod(test_val1, test_val2))
+
+
+
     def test_optimize_freeze_module(self):
         in_channels, out_channels = 3, 32
         conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, bias=True)
@@ -2048,7 +2125,6 @@ class TestFrozenOptimizations(JitTestCase):
             scripted = torch.jit.freeze(torch.jit.script(mod))
             optimized = torch.jit.optimize_for_inference(scripted)
             inp = torch.rand([20, 20])
-            print(optimized.graph)
             # a1 cant be inplaced for first use, can for second
             FileCheck().check("ScalarMul_").check("ScalarMul(").check("ScalarMul_").run(optimized.graph)
             self.assertEqual(optimized(inp), mod(inp))
