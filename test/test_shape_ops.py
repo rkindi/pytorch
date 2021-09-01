@@ -67,6 +67,7 @@ class TestShapeOps(TestCase):
 
         table1D = [1., 2., 3.]
         tensor1D = torch.tensor(table1D)
+
         storage = torch.Storage(table1D)
         self.assertEqual(tensor1D.tolist(), table1D)
         self.assertEqual(storage.tolist(), table1D)
