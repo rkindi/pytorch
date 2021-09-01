@@ -432,5 +432,41 @@ TEST(MemoryPlannerTest, LSTMGreedyByBreadth) {
       *graph, expected_storage, expected_allocs, expected_successors);
 }
 
+TEST(MemoryTracingTest, Allocator) {
+  constexpr int batch_size = 1;
+  constexpr int input_size = 32;
+
+  int hidden_size = 2 * input_size;
+
+  auto g = build_lstm();
+  std::vector<MemEvent> mem_events;
+  Code cd(g, "lstm");
+
+  {
+    c10::WithProfileTracingAllocationsGuard profile_guard(at::kCPU);
+    auto input = at::randn({batch_size, input_size}, at::kCPU);
+    auto hx = at::randn({batch_size, hidden_size}, at::kCPU);
+    auto cx = at::randn({batch_size, hidden_size}, at::kCPU);
+    auto w_ih = at::randn({4 * hidden_size, input_size}, at::kCPU).t();
+    auto w_hh = at::randn({4 * hidden_size, hidden_size}, at::kCPU).t();
+    torch::jit::Inline(*g);
+    auto stack = createStack({input, hx, cx, w_ih, w_hh});
+    InterpreterState is{cd};
+    is.run(stack);
+    mem_events = profile_guard.getAllocationTraces();
+  }
+
+  std::shared_ptr<Graph> graph(
+      cd.instructions_source().front()->owningGraph(), [](Graph*) {});
+
+  for (int strategy = static_cast<int>(Strategy::NAIVE);
+       strategy <= static_cast<int>(Strategy::LINEAR_SCAN);
+       strategy++) {
+    std::cout << "running " << static_cast<Strategy>(strategy) << "\n";
+    jit::planMemoryWithTracing(
+        graph, static_cast<Strategy>(strategy), mem_events, at::kCPU);
+  }
+}
+
 } // namespace jit
 } // namespace torch
