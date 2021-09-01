@@ -1,4 +1,5 @@
 #include <torch/csrc/jit/passes/memory_planning.h>
+#include <torch/csrc/jit/passes/memory_planning/greedy_by_size.h>
 #include <torch/csrc/jit/passes/memory_planning/linear_scan.h>
 
 #include <jit/tensorexpr/kernel.h>
@@ -65,9 +66,8 @@ bool intersectMemRegion(MemRegion reg1, MemRegion reg2) {
 std::vector<MemAllocation> naive(
     std::unordered_map<LiveRange, int64_t, live_range_hash>
         managed_live_ranges) {
-  std::map<LiveRange, int64_t, live_range_start_cmp>
-      sorted_managed_live_ranges(
-          managed_live_ranges.begin(), managed_live_ranges.end());
+  std::map<LiveRange, int64_t, live_range_start_cmp> sorted_managed_live_ranges(
+      managed_live_ranges.begin(), managed_live_ranges.end());
   std::vector<MemAllocation> allocations;
   allocations.reserve(managed_live_ranges.size());
   int64_t offset = 0;
@@ -355,6 +355,18 @@ void planMemory(std::shared_ptr<Graph>& graph, Strategy strat) {
       allocations = linearScanHeuristic(managed_live_ranges);
       break;
     };
+    case Strategy::GREEDY_BY_SIZE: {
+      allocations = greedyBySize(managed_live_ranges);
+      break;
+    }
+    case Strategy::GREEDY_BY_SIZE_WITH_FIRST_GAP: {
+      allocations = greedyBySizeWithFirstGap(managed_live_ranges);
+      break;
+    }
+    case Strategy::GREEDY_BY_LONGEST_AND_SIZE: {
+      allocations = greedyBySizeAndLongestWithFirstGap(managed_live_ranges);
+      break;
+    }
     default:
       return;
   }
@@ -375,6 +387,10 @@ void planMemory(std::shared_ptr<Graph>& graph, Strategy strat) {
     }
     managed_range_values.insert({item.second, item.first});
   }
+
+  std::stringstream allocs_str;
+  printAllocation(allocs_str, allocations, managed_range_values);
+  GRAPH_DEBUG("\nallocs\n", allocs_str.str());
 
   GRAPH_DEBUG("\ngraph before inserting storage node\n", *graph);
 
