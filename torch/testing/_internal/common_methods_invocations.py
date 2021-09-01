@@ -6117,10 +6117,8 @@ op_db: List[OpInfo] = [
            dtypes=all_types_and_complex_and(torch.bool, torch.bfloat16, torch.float16),
            sample_inputs_func=sample_inputs_contiguous,
            supports_forward_ad=True,
-           skips=(
-               # JIT has issue when op is passed as lambda
-               SkipInfo('TestJit', 'test_variant_consistency_jit'),
-           ),
+           autodiff_fusible_nodes=['aten::contiguous'],
+           assert_jit_shape_analysis=True,
            supports_out=False),
     OpInfo('symeig',
            dtypes=floating_and_complex_types(),
@@ -7215,6 +7213,7 @@ op_db: List[OpInfo] = [
            dtypesIfCPU=floating_types_and(torch.bfloat16),
            dtypesIfCUDA=floating_types_and(torch.half, torch.bfloat16),
            sample_inputs_func=sample_inputs_softmax_variant,
+           assert_jit_shape_analysis=True,
            assert_autodiffed=True,
            supports_out=False),
     OpInfo('softmax',
@@ -7958,6 +7957,7 @@ op_db: List[OpInfo] = [
                    backward_dtypesIfCPU=all_types_and_complex_and(torch.bool, torch.bfloat16),
                    assert_autodiffed=True,
                    safe_casts_outputs=True,
+                   assert_jit_shape_analysis=True,
                    supports_forward_ad=True,
                    skips=(
                        SkipInfo('TestUnaryUfuncs', 'test_reference_numerics_extremal',
@@ -8875,6 +8875,7 @@ op_db: List[OpInfo] = [
                    dtypes=all_types_and(torch.bool, torch.bfloat16),
                    dtypesIfCUDA=all_types_and(torch.bool, torch.half, torch.bfloat16),
                    assert_autodiffed=True,
+                   assert_jit_shape_analysis=True,
                    safe_casts_outputs=True),
     UnaryUfuncInfo('erfc',
                    ref=scipy.special.erfc if TEST_SCIPY else _NOTHING,
