@@ -121,6 +121,7 @@ bool mayContainAlias(
   }
   return db.mayContainAlias(as, bs);
 }
+}
 
 // Get set of all inputs/outputs/constants (always alive) and their aliases
 FastSet<const Value*> GetAlwaysAliveValues(
@@ -158,12 +159,9 @@ FastSet<const Value*> GetAlwaysAliveValues(
   return always_alive;
 }
 
-//  Map each value to all values that are alive at the same time.
-using LivenessMap = FastMap<const Value*, std::set<const Value*>>;
-
 //  The algorithm does a traversal of the execution graph
 //  while keeping track of the live values.
-LivenessMap GetLivenessMap(
+std::pair<LivenessMap, LiveRangesMap> GetLiveness(
     const std::shared_ptr<torch::jit::Graph>& graph,
     const FastSet<const Value*>& always_alive,
     AliasDb& db) {
@@ -173,14 +171,21 @@ LivenessMap GetLivenessMap(
   // map Values to its creation order in graph (Note: only traverse top-level
   // nodes such that nodes under control-flows are represented by top-level
   // block nodes)
+  int idx = 1;
   std::vector<const Value*> values_in_creation_order;
   FastMap<const Value*, size_t> values_to_idx_in_creation_order;
+  std::unordered_map<const Node*, size_t> nodes_to_idx_in_topo_order;
   for (const auto* node : graph->nodes()) {
+    nodes_to_idx_in_topo_order[node] = idx++;
     for (const auto* v : node->outputs()) {
       values_to_idx_in_creation_order[v] = values_in_creation_order.size();
       values_in_creation_order.emplace_back(v);
     }
   }
+
+  std::unordered_map<const Value*, size_t> value_creation_topo_idx;
+  std::unordered_map<const Value*, std::unordered_set<size_t>>
+      value_use_topo_idxs;
 
   // presence of a Value in live_values_use_chain means the Value alive
   // Value mapped to set of Nodes that may use the Value (i.e., use-chain of
@@ -213,6 +218,7 @@ LivenessMap GetLivenessMap(
       const auto* node = u.user;
       live_values_use_chain.at(v).insert(node);
       live_nodes_def_chain[node].insert(v);
+      value_use_topo_idxs[v].insert(nodes_to_idx_in_topo_order[node]);
     }
 
     // FIXME(penguin): the following alias refinement seems to assume
@@ -242,7 +248,9 @@ LivenessMap GetLivenessMap(
         // are our own
         live_values_use_chain.at(v).insert(node);
         live_nodes_def_chain[node].insert(v);
+        value_use_topo_idxs[v].insert(nodes_to_idx_in_topo_order[node]);
       }
+      value_creation_topo_idx[aliased_v] = value_creation_topo_idx[v];
     }
   };
 
@@ -262,6 +270,7 @@ LivenessMap GetLivenessMap(
     for (const auto* v : node->outputs()) {
       if (always_alive.count(v) == 0) {
         add_live_value_fn(v);
+        value_creation_topo_idx[v] = nodes_to_idx_in_topo_order[node];
       }
     }
 
@@ -307,8 +316,19 @@ LivenessMap GetLivenessMap(
     }
   }
 
-  return liveness_map;
+  LiveRangesMap live_ranges;
+  for (const auto& item : value_use_topo_idxs) {
+    auto value = item.first;
+    auto idxs = item.second;
+
+    live_ranges[value] = {
+        value_creation_topo_idx[value], *std::max_element(begin(idxs), end(idxs))};
+  }
+
+  return std::make_pair(liveness_map, live_ranges);
 }
+
+namespace {
 
 // Collect the set of Values that are candidates for memory planning:
 //   - Values that are used in in-place operators (i.e., _out variants), and
@@ -668,7 +688,7 @@ StaticModule::StaticModule(
   external_values_ = GetAlwaysAliveValues(graph_, alias_db);
 
   if (opts_.optimize_memory) {
-    auto lm = GetLivenessMap(graph_, external_values_, alias_db);
+    auto lm = GetLiveness(graph_, external_values_, alias_db).first;
     auto values = GetMemoryPlanningCandidates(graph_, node_has_out_variant);
     value_to_same_storage_values_ =
         GenerateSameStorageValues(lm, external_values_, values, alias_db);
@@ -1325,13 +1345,20 @@ MemoryPlanner::MemoryPlanner(
 
 // Don't change the size if it is already aligned, otherwise increase the size
 // to make it aligned.
-size_t MemoryPlanner::compute_aligned_tensor_size(size_t nbytes) {
+size_t MemoryPlanner::computeAlignedTensorSize(size_t nbytes) {
   // Note: everything below is size_t
   return (nbytes + c10::gAlignment - 1) & (~(c10::gAlignment - 1));
 }
 
-at::DataPtr MemoryPlanner::allocate_buffer(size_t size) {
-  at::Allocator* allocator = c10::GetCPUCachingAllocator();
+at::DataPtr MemoryPlanner::allocateBuffer(
+    size_t size,
+    at::DeviceType deviceType) {
+  at::Allocator* allocator;
+  if (deviceType == at::kCPU) {
+    allocator = c10::GetCPUCachingAllocator();
+  } else {
+    allocator = GetAllocator(deviceType);
+  }
   return allocator->allocate(size);
 }
 
@@ -1339,7 +1366,7 @@ void MemoryPlanner::allocate() {
   if (managed_bytes_ == 0) {
     return;
   }
-  buffer_ = allocate_buffer(managed_bytes_);
+  buffer_ = allocateBuffer(managed_bytes_);
 
   size_t offset = 0;
   uint8_t* start = static_cast<uint8_t*>(buffer_.get());
@@ -1377,7 +1404,7 @@ void MemoryPlanner::deallocate() {
     size_t max = ms.first;
     for (auto& tensor : tensors) {
       size_t current_size =
-          compute_aligned_tensor_size(tensor->storage().nbytes());
+          computeAlignedTensorSize(tensor->storage().nbytes());
       tensor->storage().unsafeGetStorageImpl()->reset();
       max = std::max(max, current_size);
     }
